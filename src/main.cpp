@@ -2,7 +2,10 @@ namespace
 {
 	constexpr std::string_view kTongueRoot = "tong1 1"sv;  // compare sur la FIN du nom (HDT-SMP renomme les bones d'armure)
 
-	struct Seen { RE::NiAVObject* root{}; RE::NiAVObject* tongue{}; };
+	constexpr RE::FormID kTestActor = 0x00091918;  // Uthgerd
+	constexpr float kTestOffsetZ = 2.0f;
+
+	struct Seen { RE::NiAVObject* root{}; RE::NiAVObject* tongue{}; RE::NiAVObject* baseFor{}; float baseZ{}; };
 	std::unordered_map<RE::FormID, Seen> g_seen;
 	std::jthread g_ticker;
 	std::atomic_bool g_queued{ false };
@@ -75,6 +78,11 @@ namespace
 		if (!root) return;
 		auto* tongue = FindTongue(root);
 		auto& s = g_seen[a->GetFormID()];
+
+		if (tongue && a->GetFormID() == kTestActor) {
+			if (s.baseFor != tongue) { s.baseFor = tongue; s.baseZ = tongue->local.translate.z; }  // valeur d'origine, memorisee une fois
+			tongue->local.translate.z = s.baseZ + kTestOffsetZ;                                       // reapplique a chaque poll
+		}
 		if (s.root == root && s.tongue == tongue) return;
 
 		std::vector<std::string> lines;
@@ -82,7 +90,8 @@ namespace
 		Collect(root, false, lines, face);
 		if (!face) return;
 
-		s = { root, tongue };
+		s.root = root; s.tongue = tongue;
+
 		const auto* race = a->GetRace();
 		const char* edid = race ? race->GetFormEditorID() : nullptr;
 		SKSE::log::info("==== {} [{:08X}] race={} tongueRoot={}", a->GetName(), a->GetFormID(), edid && *edid ? edid : "?", tongue ? "FOUND" : "none");
@@ -109,7 +118,7 @@ namespace
 
 void OnDataLoaded()
 {
-	SKSE::log::info("Data loaded TongueFix");
+	SKSE::log::info("Init TongueFix");
 
 	g_ticker = std::jthread([](std::stop_token st) {
 		while (!st.stop_requested()) {
@@ -141,8 +150,6 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
-
-	SKSE::log::info("Start TongueFix");
 
 	auto messaging = SKSE::GetMessagingInterface();
 	if (!messaging->RegisterListener("SKSE", MessageHandler)) {
