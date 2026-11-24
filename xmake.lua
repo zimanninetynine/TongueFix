@@ -1,5 +1,5 @@
 -- info to change
-local name = "commonlibsse-ng-template"
+local name = "TongueFix"
 local author = "ziman99"
 local description = "SKSE64 plugin template using CommonLibSSE-NG"
 local version = "0.0.0"
@@ -44,13 +44,6 @@ target(name)
         name = name,
         author = author,
         description = description
-    })
-
-    -- copy a folder named ini to output
-    add_rules("template.copy_resources", {
-        files = {
-            {src = "ini/Settings.ini", dest = string.format("SKSE/Plugins/%s/Settings.ini", name)}
-        }
     })
 
     -- add src files
