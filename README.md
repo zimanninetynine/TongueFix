@@ -1,6 +1,6 @@
-# CommonLibSSE-NG Plugin Template
+# TongueFix
 
-This is a basic plugin template using CommonLibSSE-NG.
+Alignment fixes for Halos HDT Tongues.
 
 ### Requirements
 * [XMake](https://xmake.io) [2.8.2+]
