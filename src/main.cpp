@@ -1,12 +1,23 @@
 namespace
 {
 	constexpr std::string_view kTongueRoot = "tong1 1"sv;  // compare sur la FIN du nom (HDT-SMP renomme les bones d'armure)
+	constexpr std::string_view kHeadNode = "NPC Head [Head]"sv;
+	constexpr std::string_view kHelperName = "TongueFixHead"sv;  // noeud d'aide cree sous la tete de chaque acteur
 
-	constexpr RE::FormID kTestActor = 0x00091918;  // Uthgerd
-	constexpr float kTestOffsetZ = 2.0f;
+	constexpr float kOffsetZ = 2.5f;  // + = monte, - = descend
+	constexpr float kOffsetY = 1.2f;  // + = avance (vers l'exterieur de la bouche), - = recule (vers la gorge)
 
-	struct Seen { RE::NiAVObject* root{}; RE::NiAVObject* tongue{}; RE::NiAVObject* baseFor{}; float baseZ{}; };
-	std::unordered_map<RE::FormID, Seen> g_seen;
+	constexpr int kMaxTries = 200;  // scans pendant lesquels on attend que la shape de la langue soit attachee
+
+	struct State
+	{
+		RE::NiAVObject* root{};
+		RE::NiAVObject* tongue{};
+		float baseY{}, baseZ{};
+		bool done{ false };  // skin rattachee (ou abandon apres kMaxTries)
+		int tries{ 0 };
+	};
+	std::unordered_map<RE::FormID, State> g_state;
 	std::jthread g_ticker;
 	std::atomic_bool g_queued{ false };
 
@@ -22,83 +33,106 @@ namespace
 		return it != s.end();
 	}
 
-	RE::NiAVObject* FindTongue(RE::NiAVObject* o)
+	// Premier noeud dont le nom FINIT par suffix
+	RE::NiAVObject* FindNode(RE::NiAVObject* o, std::string_view suffix)
 	{
 		if (!o) return nullptr;
 		auto n = Name(o);
-		if (n.size() >= kTongueRoot.size() && n.substr(n.size() - kTongueRoot.size()) == kTongueRoot) return o;
+		if (n.size() >= suffix.size() && n.substr(n.size() - suffix.size()) == suffix) return o;
 		if (auto* node = o->AsNode()) {
 			for (auto& c : node->GetChildren()) {
-				if (auto* f = FindTongue(c.get()))
+				if (auto* f = FindNode(c.get(), suffix))
 					return f;
 			}
 		}
 		return nullptr;
 	}
 
-	// Une ligne de log par shape interessante. face = true si une shape est sous le noeud FaceGen.
-	void Collect(RE::NiAVObject* o, bool underFace, std::vector<std::string>& lines, bool& face)
+	// Noeud d'aide : enfant de la tete, meme rotation et echelle qu'elle (rotation identite, echelle 1), seule sa translation change.
+	RE::NiNode* GetHelper(RE::NiAVObject* head)
+	{
+		auto* headNode = head ? head->AsNode() : nullptr;
+		if (!headNode) return nullptr;
+		for (auto& c : headNode->GetChildren()) {
+			if (c && Name(c.get()) == kHelperName) return c->AsNode();
+		}
+		auto* h = RE::NiNode::Create(0);
+		if (!h) return nullptr;
+		h->name = kHelperName.data();
+		h->local.scale = 1.0f;
+		h->local.translate = { 0.0f, kOffsetY, kOffsetZ };
+		h->world = head->world * h->local;  // valide des la premiere frame : pas de clignotement a l'origine
+		headNode->AttachChild(h, true);
+		return h;
+	}
+
+	// Pour chaque shape dont la skin contient un bone "tong1" : remplace l'entree "NPC Head [Head]" par le noeud d'aide
+	// (bones[] ET boneWorldTransforms[]).
+	void Rebind(RE::NiAVObject* o, int& rebound)
 	{
 		if (!o) return;
-		underFace = underFace || Has(Name(o), "facegen");
-		if (auto* g = o->AsGeometry(); g && (underFace || Has(Name(o), "tongue") || Has(Name(o), "mouth") || Has(Name(o), "teeth"))) {
-			face = face || underFace;
-			auto* tri = netimmerse_cast<RE::BSTriShape*>(g);
-			auto* dyn = netimmerse_cast<RE::BSDynamicTriShape*>(g);
-			const auto n = tri ? tri->GetTrishapeRuntimeData().vertexCount : 0u;
-			const auto* v = dyn ? static_cast<const RE::NiPoint4*>(dyn->GetDynamicTrishapeRuntimeData().dynamicData) : nullptr;
-			if (v && n) {
-				std::vector<float> z;
-				float mn[3]{ 1e30f, 1e30f, 1e30f }, mx[3]{ -1e30f, -1e30f, -1e30f };
-				double sum[3]{};
-				for (std::uint32_t i = 0; i < n; ++i) {
-					const float p[3]{ v[i].x, v[i].y, v[i].z };
-					for (int k = 0; k < 3; ++k) { mn[k] = (std::min)(mn[k], p[k]); mx[k] = (std::max)(mx[k], p[k]); sum[k] += p[k]; }
-					z.push_back(p[2]);
+		if (auto* g = o->AsGeometry()) {
+			auto* skin = g->GetGeometryRuntimeData().skinInstance.get();
+			if (skin && skin->bones) {
+				bool tong = false;
+				for (std::uint32_t i = 0; i < skin->numMatrices; ++i) {
+					if (Has(Name(skin->bones[i]), "tong1")) tong = true;
 				}
-				auto mid = z.begin() + z.size() / 2;
-				std::nth_element(z.begin(), mid, z.end());
-				double up = 0; int nu = 0;
-				for (float f : z) if (f >= *mid) { up += f; ++nu; }
-				lines.push_back(std::format("  {} \"{}\" DYNAMIC verts={} bbox=({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f}) centroid=({:.2f},{:.2f},{:.2f}) upperMeanZ={:.2f}",
-					underFace ? "face" : "else", Name(o), n, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], sum[0] / n, sum[1] / n, sum[2] / n, up / nu));
-			}
-			else {
-				lines.push_back(std::format("  {} \"{}\" static verts={}", underFace ? "face" : "else", Name(o), n));
+				if (tong) {
+					for (std::uint32_t i = 0; i < skin->numMatrices; ++i) {
+						auto* b = skin->bones[i];
+						if (b && Name(b) == kHeadNode) {
+							if (auto* h = GetHelper(b)) {
+								skin->bones[i] = h;
+								skin->boneWorldTransforms[i] = &h->world;
+								++rebound;
+							}
+						}
+					}
+				}
 			}
 		}
 		if (auto* node = o->AsNode()) {
-			for (auto& c : node->GetChildren()) Collect(c.get(), underFace, lines, face);
+			for (auto& c : node->GetChildren()) Rebind(c.get(), rebound);
 		}
 	}
 
 	void Process(RE::Actor* a)
 	{
-		auto* root = a ? a->Get3D() : nullptr;
+		if (!a) return;
+		auto* root = a->Get3D();
 		if (!root) return;
-		auto* tongue = FindTongue(root);
-		auto& s = g_seen[a->GetFormID()];
-
-		if (tongue && a->GetFormID() == kTestActor) {
-			if (s.baseFor != tongue) { s.baseFor = tongue; s.baseZ = tongue->local.translate.z; }  // valeur d'origine, memorisee une fois
-			tongue->local.translate.z = s.baseZ + kTestOffsetZ;                                       // reapplique a chaque poll
+		auto* tongue = FindNode(root, kTongueRoot);
+		if (!tongue) {
+			g_state.erase(a->GetFormID());  // plus de langue : on repartira de zero si elle revient
+			return;
 		}
-		if (s.root == root && s.tongue == tongue) return;
 
-		std::vector<std::string> lines;
-		bool face = false;
-		Collect(root, false, lines, face);
-		if (!face) return;
-
-		s.root = root; s.tongue = tongue;
-
-		const auto* race = a->GetRace();
-		const char* edid = race ? race->GetFormEditorID() : nullptr;
-		SKSE::log::info("==== {} [{:08X}] race={} tongueRoot={}", a->GetName(), a->GetFormID(), edid && *edid ? edid : "?", tongue ? "FOUND" : "none");
-		if (tongue) {
-			SKSE::log::info("  tongue root local.t=({:.3f},{:.3f},{:.3f})", tongue->local.translate.x, tongue->local.translate.y, tongue->local.translate.z);
+		auto& s = g_state[a->GetFormID()];
+		if (s.root != root || s.tongue != tongue) {  // nouvelle langue (ou nouveau 3D) : memorise la position d'origine du bone
+			s = State{};
+			s.root = root;
+			s.tongue = tongue;
+			s.baseY = tongue->local.translate.y;
+			s.baseZ = tongue->local.translate.z;
+			SKSE::log::info("Langue trouvee sur {} [{:08X}] : origine Y={:.3f} Z={:.3f}", a->GetName(), a->GetFormID(), s.baseY, s.baseZ);
 		}
-		for (auto& l : lines) SKSE::log::info("{}", l);
+
+		tongue->local.translate.y = s.baseY + kOffsetY;  // moitie avant : la chaine tong1
+		tongue->local.translate.z = s.baseZ + kOffsetZ;
+
+		if (!s.done) {  // moitie arriere : les vertices attaches a la tete. On reessaie tant que la shape n'est pas attachee.
+			int rebound = 0;
+			Rebind(root, rebound);
+			if (rebound) {
+				s.done = true;
+				SKSE::log::info("  {} : skin rattachee au noeud d'aide ({} entree(s))", a->GetName(), rebound);
+			}
+			else if (++s.tries >= kMaxTries) {
+				s.done = true;
+				SKSE::log::info("  {} : aucune shape de langue trouvee apres {} scans, abandon", a->GetName(), kMaxTries);
+			}
+		}
 	}
 
 	void Poll()
@@ -122,12 +156,12 @@ void OnDataLoaded()
 
 	g_ticker = std::jthread([](std::stop_token st) {
 		while (!st.stop_requested()) {
-			std::this_thread::sleep_for(2s);
+			std::this_thread::sleep_for(500ms);
 			if (!g_queued.exchange(true)) SKSE::GetTaskInterface()->AddTask([] {
 				Poll();
-			});
+				});
 		}
-	});
+		});
 }
 
 void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
